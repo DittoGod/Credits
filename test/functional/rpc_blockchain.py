@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) 2014-2017 The Bitcoin Core developers
+# Copyright (c) 2014-2018 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test RPCs related to blockchainstate.
@@ -32,6 +32,17 @@ from test_framework.util import (
     assert_is_hex_string,
     assert_is_hash_string,
 )
+from test_framework.blocktools import (
+    create_block,
+    create_coinbase,
+)
+from test_framework.messages import (
+    msg_block,
+)
+from test_framework.mininode import (
+    P2PInterface,
+)
+
 
 class BlockchainTest(BitcoinTestFramework):
     def set_test_params(self):
@@ -46,6 +57,7 @@ class BlockchainTest(BitcoinTestFramework):
         self._test_getdifficulty()
         self._test_getnetworkhashps()
         self._test_stopatheight()
+        self._test_waitforblockheight()
         assert self.nodes[0].verifychain(4, 0)
 
     def _test_getblockchaininfo(self):
@@ -182,13 +194,10 @@ class BlockchainTest(BitcoinTestFramework):
         node.reconsiderblock(b1hash)
 
         res3 = node.gettxoutsetinfo()
-        assert_equal(res['total_amount'], res3['total_amount'])
-        assert_equal(res['transactions'], res3['transactions'])
-        assert_equal(res['height'], res3['height'])
-        assert_equal(res['txouts'], res3['txouts'])
-        assert_equal(res['bogosize'], res3['bogosize'])
-        assert_equal(res['bestblock'], res3['bestblock'])
-        assert_equal(res['hash_serialized_2'], res3['hash_serialized_2'])
+        # The field 'disk_size' is non-deterministic and can thus not be
+        # compared between res and res3.  Everything else should be the same.
+        del res['disk_size'], res3['disk_size']
+        assert_equal(res, res3)
 
     def _test_getblockheader(self):
         node = self.nodes[0]
@@ -204,6 +213,7 @@ class BlockchainTest(BitcoinTestFramework):
         assert_equal(header['confirmations'], 1)
         assert_equal(header['previousblockhash'], secondbesthash)
         assert_is_hex_string(header['chainwork'])
+        assert_equal(header['nTx'], 1)
         assert_is_hash_string(header['hash'])
         assert_is_hash_string(header['previousblockhash'])
         assert_is_hash_string(header['merkleroot'])
@@ -240,6 +250,45 @@ class BlockchainTest(BitcoinTestFramework):
         self.nodes[0].wait_until_stopped()
         self.start_node(0)
         assert_equal(self.nodes[0].getblockcount(), 207)
+
+    def _test_waitforblockheight(self):
+        self.log.info("Test waitforblockheight")
+        node = self.nodes[0]
+        node.add_p2p_connection(P2PInterface())
+
+        current_height = node.getblock(node.getbestblockhash())['height']
+
+        # Create a fork somewhere below our current height, invalidate the tip
+        # of that fork, and then ensure that waitforblockheight still
+        # works as expected.
+        #
+        # (Previously this was broken based on setting
+        # `rpc/blockchain.cpp:latestblock` incorrectly.)
+        #
+        b20hash = node.getblockhash(20)
+        b20 = node.getblock(b20hash)
+
+        def solve_and_send_block(prevhash, height, time):
+            b = create_block(prevhash, create_coinbase(height), time)
+            b.solve()
+            node.p2p.send_message(msg_block(b))
+            node.p2p.sync_with_ping()
+            return b
+
+        b21f = solve_and_send_block(int(b20hash, 16), 21, b20['time'] + 1)
+        b22f = solve_and_send_block(b21f.sha256, 22, b21f.nTime + 1)
+
+        node.invalidateblock(b22f.hash)
+
+        def assert_waitforheight(height, timeout=2):
+            assert_equal(
+                node.waitforblockheight(height, timeout)['height'],
+                current_height)
+
+        assert_waitforheight(0)
+        assert_waitforheight(current_height - 1)
+        assert_waitforheight(current_height)
+        assert_waitforheight(current_height + 1)
 
 
 if __name__ == '__main__':
